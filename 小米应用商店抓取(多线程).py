@@ -1,106 +1,125 @@
 import requests
-from fake_useragent import UserAgent
 from threading import Thread
 from queue import Queue
 import time
+from useragents import ua_list
 from lxml import etree
-import pymysql
-import random
+import csv
 from threading import Lock
-import math
+import random
+
+class XiaomiSpider(object):
+  def __init__(self):
+    self.url = 'http://app.mi.com/categotyAllListApi?page={}&categoryId={}&pageSize=30'
+    # 存放所有URL地址的队列
+    self.q = Queue()
+    self.i = 0
+    # 存放所有类型id的空列表
+    self.id_list = []
+    # 打开文件
+    self.f = open('xiaomi.csv','a')
+    self.writer = csv.writer(self.f)
+    # 创建锁
+    self.lock = Lock()
 
 
-class XiaoMiSpider(object):
-    def __init__(self):
-        self.base_url = 'http://app.mi.com/'
-        self.type_url = 'http://app.mi.com/categotyAllListApi?page={}&categoryId={}&pageSize=30'
-        self.q = Queue()  # 创建队列
-        self.ua = UserAgent()
-        self.i = 0
-        self.app_type_list_info = []
-        self.conn = pymysql.connect('127.0.0.1', '用户名', '密码', 'xm_db', charset='utf8mb4')
-        self.cursor = self.conn.cursor()
-        self.lock = Lock()  # 创建锁
+  def get_cateid(self):
+    # 请求
+    url = 'http://app.mi.com/'
+    headers = { 'User-Agent': random.choice(ua_list)}
+    print(headers)
+    html = requests.get(url=url,headers=headers).text
+    # 解析
+    parse_html = etree.HTML(html)
+    xpath_bds = '//ul[@class="category-list"]/li'
+    li_list = parse_html.xpath(xpath_bds)
+    for li in li_list:
+      typ_name = li.xpath('./a/text()')[0]
+      typ_id = li.xpath('./a/@href')[0].split('/')[-1]
+      # 计算每个类型的页数
+      pages = self.get_pages(typ_id)
+      self.id_list.append( (typ_id,pages) )
 
-    def get_type_info(self):
-        headers = {'User-Agent': self.ua.random}
-        html = requests.get(self.base_url, headers=headers).text
-        parse_html = etree.HTML(html)
-        base_info = parse_html.xpath('//div[@class="sidebar"]/div[2]/ul/li')
-        for info in base_info:
-            category_id = info.xpath('./a/@href')[0].split('/')[-1]
-            app_count = self.get_app_num(category_id)
-            self.app_type_list_info.append((category_id, app_count))
-        print('app类型列表抓取完毕!')
-        self.url_in()
+    # 入队列
+    self.url_in()
 
-    def get_app_num(self, category_id):
-        url = self.type_url.format(0, category_id)
-        headers = {'User-Agent': self.ua.random}
-        html = requests.get(url, headers=headers).json()
-        app_count = html['count']
-        return app_count
+  # 获取counts的值并计算页数
+  def get_pages(self,typ_id):
+    # 每页返回的json数据中,都有count这个key
+    url = self.url.format(0,typ_id)
+    html = requests.get(
+      url=url,
+      headers={'User-Agent':random.choice(ua_list)}
+    ).json()
+    count = html['count']
+    pages = int(count) // 30 + 1
 
+    return pages
+
+  # url入队列
+  def url_in(self):
+    for id in self.id_list:
+      # id为元组,('2',pages)
+      for page in range(2):
+        url = self.url.format(page,id[0])
+        # 把URL地址入队列
+        self.q.put(url)
+
+  # 线程事件函数: get() - 请求 - 解析 - 处理数据
+  def get_data(self):
+    while True:
+      if not self.q.empty():
+        url = self.q.get()
+        headers = {'User-Agent':random.choice(ua_list)}
+        html = requests.get(url=url,headers=headers).json()
+        self.parse_html(html)
+      else:
+        break
+
+  # 解析函数
+  def parse_html(self,html):
+    # 存放1页的数据 - 写入到csv文件
+    app_list = []
+
+    for app in html['data']:
+      # 应用名称 + 链接 + 分类
+      name = app['displayName']
+      link = 'http://app.mi.com/details?id=' + \
+             app['packageName']
+      typ_name = app['level1CategoryName']
+      # 把每一条数据放到app_list中,目的为了 writerows()
+      app_list.append([name,typ_name,link])
+
+      print(name,typ_name)
+      self.i += 1
+
+    # 开始写入1页数据 - app_list
+    self.lock.acquire()
+    self.writer.writerows(app_list)
+    self.lock.release()
+
+  # 主函数
+  def main(self):
     # URL入队列
-    def url_in(self):
-        for info in self.app_type_list_info:
-            for page in range(math.ceil(int(info[1]) // 30)):
-                url = self.type_url.format(page, info[0])
-                self.q.put(url)
+    self.get_cateid()
+    t_list = []
+    # 创建多个线程
+    for i in range(1):
+      t = Thread(target=self.get_data)
+      t_list.append(t)
+      t.start()
 
-    # 线程事件type_id
-    def get_data(self):
-        while True:
-            if not self.q.empty():
-                url = self.q.get()
-                headers = {'User-Agent': self.ua.random}
-                html = requests.get(url, headers=headers).json()
-                self.parse_html(html)
-            else:
-                break
+    # 回收线程
+    for t in t_list:
+      t.join()
 
-    def parse_html(self, html):
-        app_list = []
-        time.sleep(2)
-        for info in html['data']:
-            app_name = info['displayName']
-            app_link = 'http://app.mi.com/details?id=' + info['packageName']
-            app_type = info['level1CategoryName']
-            app_list.append([app_type, app_name, app_link])
-            self.i += 1
-            print(f'{app_name}抓取完毕')
-        self.save_to_file(app_list)
-        time.sleep(random.randint(1, 3))
-
-    def save_to_file(self, app_list):
-        self.lock.acquire()
-        ins = 'insert into app_info (app_type, app_name, app_link) values (%s,%s,%s)'
-        try:
-            self.cursor.executemany(ins, app_list)
-        except Exception as e:
-            print('error', e)
-        self.lock.release()
-
-    def main(self):
-        self.get_type_info()
-        t_list = []
-        for i in range(3):
-            t = Thread(target=self.get_data)
-            t_list.append(t)
-            t.start()
-
-        for t in t_list:
-            t.join()
-        print(f'共{self.i}条数据')
-        self.conn.commit()
-        self.cursor.close()
-        self.conn.close()
-
+    # 关闭文件
+    self.f.close()
+    print('数量:',self.i)
 
 if __name__ == '__main__':
-    start_time = time.time()
-    spider = XiaoMiSpider()
-    spider.main()
-    end_time = time.time()
-    print(f'执行时间{(end_time - start_time)}s')
-    
+  start = time.time()
+  spider = XiaomiSpider()
+  spider.main()
+  end = time.time()
+  print('执行时间:%.2f' % (end-start))
